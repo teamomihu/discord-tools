@@ -15,6 +15,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_setClipboard
 // @connect      translate.googleapis.com
+// @connect      generativelanguage.googleapis.com
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
@@ -30,6 +31,9 @@
   const CONFIG = {
     // ---------- 模块1「看」翻译 ----------
     translateMode: "auto", // "auto" = 自动翻译 | "manual" = 点击按钮翻译
+
+    // ---------- Gemini AI 回复 ----------
+    geminiApiKey: "", // 留空则用预设话术，填了则用 AI 生成回复
 
     // ---------- 模块2「说」黑话词库 ----------
     slangDict: {
@@ -112,6 +116,7 @@
     // ---------- 加载/保存 ----------
     async load() {
       this.translateMode = await GM_getValue("translateMode", this.translateMode);
+      this.geminiApiKey = await GM_getValue("geminiApiKey", this.geminiApiKey);
       const savedDict = await GM_getValue("slangDict", null);
       if (savedDict) {
         // 合并：保留内置词库，覆盖自定义分类
@@ -247,6 +252,155 @@
     .merida-translate-btn.loading {
       pointer-events: none;
       opacity: 0.4;
+    }
+    /* ---- 内联翻译链接（未翻译消息下方） ---- */
+    .merida-translate-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: #7289da;
+      font-size: 12px;
+      cursor: pointer;
+      margin-top: 4px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      transition: background 0.15s, color 0.15s;
+      user-select: none;
+    }
+    .merida-translate-link:hover {
+      background: rgba(114, 137, 218, 0.15);
+      color: #fff;
+    }
+    .merida-translate-link.loading {
+      opacity: 0.5;
+      pointer-events: none;
+    }
+    .merida-translate-link svg {
+      width: 14px;
+      height: 14px;
+    }
+
+    /* ---- 建议回复按钮 ---- */
+    .merida-reply-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: #faa61a;
+      font-size: 12px;
+      cursor: pointer;
+      margin-top: 4px;
+      margin-left: 8px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      transition: background 0.15s, color 0.15s;
+      user-select: none;
+    }
+    .merida-reply-link:hover {
+      background: rgba(250, 166, 26, 0.15);
+      color: #fff;
+    }
+
+    /* ---- 建议回复下拉面板 ---- */
+    .merida-reply-panel {
+      background: #2f3136;
+      border: 1px solid #40444b;
+      border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      margin-top: 6px;
+      max-height: 300px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .merida-reply-tabs {
+      display: flex;
+      border-bottom: 1px solid #40444b;
+      overflow-x: auto;
+      flex-shrink: 0;
+      padding: 0 4px;
+    }
+    .merida-reply-tab {
+      padding: 6px 10px;
+      cursor: pointer;
+      color: #999;
+      font-size: 12px;
+      white-space: nowrap;
+      border-bottom: 2px solid transparent;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .merida-reply-tab:hover { color: #dcddde; }
+    .merida-reply-tab.active {
+      color: #faa61a;
+      border-bottom-color: #faa61a;
+    }
+    .merida-reply-items {
+      overflow-y: auto;
+      padding: 4px;
+      flex: 1;
+    }
+    .merida-reply-item {
+      padding: 6px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.15s;
+      margin-bottom: 2px;
+    }
+    .merida-reply-item:hover {
+      background: rgba(250, 166, 26, 0.12);
+    }
+    .merida-reply-item-en {
+      color: #fff;
+      font-size: 13px;
+    }
+    .merida-reply-item-zh {
+      color: #faa61a;
+      font-size: 11px;
+      margin-top: 2px;
+      opacity: 0.8;
+    }
+    /* ---- 复制按钮 ---- */
+    .merida-reply-item-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+    }
+    .merida-reply-item-text {
+      flex: 1;
+      min-width: 0;
+    }
+    .merida-copy-btn {
+      flex-shrink: 0;
+      background: #40444b;
+      border: none;
+      color: #b9bbbe;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s, color 0.15s;
+      margin-top: 2px;
+    }
+    .merida-copy-btn:hover {
+      background: #7289da;
+      color: #fff;
+    }
+    .merida-copy-btn.copied {
+      background: #43b581;
+      color: #fff;
+    }
+    /* ---- AI 生成状态 ---- */
+    .merida-ai-loading {
+      color: #999;
+      font-size: 13px;
+      padding: 20px;
+      text-align: center;
+    }
+    .merida-ai-tab {
+      background: linear-gradient(90deg, #faa61a, #f04747);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      font-weight: 700;
     }
 
     /* ---- 模块2「说」黑话面板 ---- */
@@ -467,10 +621,11 @@
       const regex = this._buildRegex();
       if (!regex) return;
 
-      // 查找消息文本容器
-      const markupEl =
-        msgNode.querySelector('[class*="messageContent_"]') ||
-        msgNode.querySelector('[class*="markup_"]');
+      // 查找消息文本容器（跳过回复引用区）
+      const allContent = msgNode.querySelectorAll('[class*="messageContent_"], [class*="markup_"]');
+      const markupEl = [...allContent].filter(
+        (el) => !el.closest('[class*="repliedMessage_"]') && !el.closest('[class*="referencedMessage_"]')
+      ).pop();
       if (!markupEl) return;
 
       const text = markupEl.textContent || "";
@@ -524,8 +679,19 @@
     _processed: new WeakSet(),  // 已处理的消息节点
     _queue: [],                 // 翻译队列
     _running: false,            // 队列是否正在处理
-    _concurrency: 2,            // 同时最多几个翻译请求
+    _concurrency: 4,            // 同时最多几个翻译请求（提高到4）
     _activeCount: 0,
+
+    // 查找消息的真正内容元素（跳过回复引用区）
+    _findContentEl(msgNode) {
+      const allContent = msgNode.querySelectorAll('[class*="messageContent_"], [class*="markup_"]');
+      // 过滤掉在引用区（repliedMessage / referencedMessage）里的元素
+      const filtered = [...allContent].filter(
+        (el) => !el.closest('[class*="repliedMessage_"]') && !el.closest('[class*="referencedMessage_"]')
+      );
+      // 返回最后一个匹配的（回复消息中，真正的内容在引用区后面）
+      return filtered.length > 0 ? filtered[filtered.length - 1] : null;
+    },
 
     // 检测文本是否主要为中文（超过 40% 中文字符则跳过翻译）
     isChinese(text) {
@@ -585,10 +751,8 @@
       if (this._processed.has(msgNode)) return;
       this._processed.add(msgNode);
 
-      // 查找消息文本
-      const contentEl =
-        msgNode.querySelector('[class*="messageContent_"]') ||
-        msgNode.querySelector('[class*="markup_"]');
+      // 查找消息文本（跳过回复引用区）
+      const contentEl = this._findContentEl(msgNode);
       if (!contentEl) return;
 
       const text = contentEl.textContent?.trim();
@@ -613,8 +777,8 @@
         if (!job) break;
         this._activeCount++;
 
-        // 延迟 300ms 错开请求
-        await new Promise((r) => setTimeout(r, 300));
+        // 延迟 150ms 错开请求
+        await new Promise((r) => setTimeout(r, 150));
 
         this._doTranslate(job).finally(() => {
           this._activeCount--;
@@ -667,9 +831,7 @@
 
     // 对单条消息执行翻译（手动触发）
     async manualTranslate(msgContainer) {
-      const contentEl =
-        msgContainer.querySelector('[class*="messageContent_"]') ||
-        msgContainer.querySelector('[class*="markup_"]');
+      const contentEl = this._findContentEl(msgContainer);
       if (!contentEl) return;
 
       const text = contentEl.textContent?.trim();
@@ -710,44 +872,386 @@
       }
     },
 
-    // 创建翻译按钮（注入到消息悬浮工具栏）
-    createButton() {
-      const btn = Utils.el("div", {
-        className: "merida-translate-btn",
-        title: "翻译此消息",
-        role: "button",
-        tabindex: "0",
-      });
-      btn.appendChild(Utils.translateSVG());
+    // 给未翻译的消息加「点击翻译」内联链接
+    addTranslateLink(msgNode) {
+      if (msgNode.querySelector(".merida-translate-link")) return;
+      if (msgNode.querySelector(".merida-translation")) return;
 
-      btn.addEventListener("click", async (e) => {
+      const contentEl = this._findContentEl(msgNode);
+      if (!contentEl) return;
+
+      const text = contentEl.textContent?.trim();
+      if (!text || text.length < 2) return;
+      if (this.isChinese(text)) return;
+      if (/^(https?:\/\/\S+\s*)+$/.test(text)) return;
+      if (/^[\p{Emoji}\s]+$/u.test(text)) return;
+
+      const link = Utils.el("div", { className: "merida-translate-link" }, [
+        "🌐 点击翻译",
+      ]);
+
+      link.addEventListener("click", async (e) => {
         e.stopPropagation();
-        if (btn.classList.contains("loading")) return;
-
-        const msgContainer =
-          btn.closest('[class*="message_"]') || btn.closest("li");
-        if (!msgContainer) return;
-
-        btn.classList.add("loading");
+        if (link.classList.contains("loading")) return;
+        link.classList.add("loading");
+        link.textContent = "🌐 翻译中...";
         try {
-          await this.manualTranslate(msgContainer);
-        } finally {
-          btn.classList.remove("loading");
+          await this.manualTranslate(msgNode);
+          link.remove(); // 翻译成功后移除链接
+        } catch (err) {
+          link.classList.remove("loading");
+          link.textContent = "🌐 重试翻译";
         }
       });
 
-      return btn;
+      contentEl.parentNode.insertBefore(link, contentEl.nextSibling);
     },
 
-    // 将翻译按钮注入到悬浮工具栏
-    injectButton(toolbar) {
-      if (toolbar.querySelector(".merida-translate-btn")) return;
-      const btn = this.createButton();
-      if (toolbar.firstChild) {
-        toolbar.insertBefore(btn, toolbar.firstChild);
-      } else {
-        toolbar.appendChild(btn);
+    // 扫描所有消息，给没翻译的加链接
+    addLinksToAll() {
+      const msgs = document.querySelectorAll('[class*="messageListItem_"]');
+      msgs.forEach((m) => this.addTranslateLink(m));
+    },
+  };
+
+  // ============================================================
+  //  第4.5层：建议回复 (Smart Reply)
+  // ============================================================
+  const SmartReply = {
+    // 回复话术库（中英对照）
+    templates: [
+      {
+        id: "agree",
+        name: "👍 赞同",
+        items: [
+          { en: "Totally agree with you! Well said! 👏", zh: "完全同意你说的！说得好！" },
+          { en: "100% this. You nailed it! 🎯", zh: "百分之百同意，你说到点子上了！" },
+          { en: "Couldn't have said it better myself!", zh: "我自己都说不出更好的了！" },
+          { en: "Facts! This is exactly what I was thinking.", zh: "没错！我也是这么想的。" },
+          { en: "Big facts. You're absolutely right. 💯", zh: "大实话，你说得对极了。" },
+        ],
+      },
+      {
+        id: "thanks",
+        name: "🙏 感谢",
+        items: [
+          { en: "Thanks so much for sharing this! Really helpful! 🙏", zh: "非常感谢你分享这个！真的很有帮助！" },
+          { en: "Appreciate the feedback! We'll definitely look into it.", zh: "感谢反馈！我们一定会跟进的。" },
+          { en: "Thanks a ton! You're a legend! 🏆", zh: "太感谢了！你是传奇！" },
+          { en: "Thank you for bringing this up! It means a lot.", zh: "谢谢你提出来！对我们很重要。" },
+          { en: "Really appreciate your support! You're awesome! ❤️", zh: "真的很感谢你的支持！你太棒了！" },
+        ],
+      },
+      {
+        id: "ask",
+        name: "❓ 追问",
+        items: [
+          { en: "That's interesting! Could you tell me more about it?", zh: "有意思！能再详细说说吗？" },
+          { en: "Good point! But what do you think about...?", zh: "说得好！但你怎么看...？" },
+          { en: "Can you elaborate on that? I'd love to understand more.", zh: "能展开说说吗？我想了解更多。" },
+          { en: "Just to clarify — do you mean...?", zh: "确认一下——你的意思是...？" },
+          { en: "How did you manage to do that? Any tips?", zh: "你是怎么做到的？有什么技巧吗？" },
+        ],
+      },
+      {
+        id: "encourage",
+        name: "💪 鼓励",
+        items: [
+          { en: "Keep it up! You're doing amazing! 🔥", zh: "继续加油！你做得太棒了！" },
+          { en: "Don't give up! We're all rooting for you! 💪", zh: "别放弃！我们都在支持你！" },
+          { en: "You got this! Believe in yourself! 🌟", zh: "你可以的！相信自己！" },
+          { en: "That's some serious progress! Well done! 👏", zh: "进步真的很大！干得好！" },
+          { en: "Stay strong! The best is yet to come! 🚀", zh: "坚持住！好戏还在后头！" },
+        ],
+      },
+      {
+        id: "feedback",
+        name: "📝 反馈",
+        items: [
+          { en: "Great suggestion! We'll pass this along to the team.", zh: "建议很棒！我们会转达给团队。" },
+          { en: "Thanks for the report! We're looking into it now.", zh: "感谢反馈！我们正在跟进。" },
+          { en: "Noted! This is on our radar. Stay tuned for updates! 📢", zh: "收到！已列入计划。关注后续更新！" },
+          { en: "We hear you! This will be addressed in the next update.", zh: "我们听到了！下次更新会解决这个问题。" },
+          { en: "Valid point! Let me discuss this with the team and get back to you.", zh: "有道理！我去跟团队讨论一下再回复你。" },
+        ],
+      },
+      {
+        id: "casual",
+        name: "😄 闲聊",
+        items: [
+          { en: "Haha that's hilarious! 😂", zh: "哈哈太搞笑了！" },
+          { en: "No way! That's crazy! 😱", zh: "不是吧！太疯狂了！" },
+          { en: "Lol nice one! 🤣", zh: "哈哈不错啊！" },
+          { en: "Same here! I feel you! 😅", zh: "我也是！深有同感！" },
+          { en: "Let's gooo! Can't wait! 🎉", zh: "冲冲冲！等不及了！" },
+          { en: "GG! That was epic! 🏅", zh: "GG！太史诗了！" },
+        ],
+      },
+    ],
+
+    // 调用 Gemini AI 生成上下文相关的回复建议
+    generateAIReplies(originalText) {
+      return new Promise((resolve, reject) => {
+        if (!CONFIG.geminiApiKey) {
+          reject(new Error("未配置 Gemini API Key"));
+          return;
+        }
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${CONFIG.geminiApiKey}`;
+
+        const prompt = `你是一个 Discord 游戏社区的管理员助手。用户发了以下消息：
+
+"${originalText}"
+
+请生成 5 条适合回复这条消息的英文话术，要求：
+1. 语气友好、自然，像真人游戏玩家的说话风格
+2. 每条回复都带一个合适的 emoji
+3. 回复要和原消息内容相关、有针对性
+4. 长度控制在 1-2 句话
+
+请严格按以下 JSON 格式返回（不要有其他文字）：
+[
+  {"en": "English reply here", "zh": "对应的中文翻译"},
+  {"en": "English reply here", "zh": "对应的中文翻译"}
+]`;
+
+        GM_xmlhttpRequest({
+          method: "POST",
+          url,
+          headers: { "Content-Type": "application/json" },
+          data: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.8, maxOutputTokens: 1024 },
+          }),
+          onload(resp) {
+            try {
+              const data = JSON.parse(resp.responseText);
+              if (data.error) {
+                reject(new Error(data.error.message || "API 错误"));
+                return;
+              }
+              const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+              // 提取 JSON 数组
+              const jsonMatch = text.match(/\[[\s\S]*\]/);
+              if (!jsonMatch) {
+                reject(new Error("AI 返回格式异常"));
+                return;
+              }
+              const replies = JSON.parse(jsonMatch[0]);
+              resolve(replies);
+            } catch (e) {
+              reject(new Error("AI 返回解析失败: " + e.message));
+            }
+          },
+          onerror(err) {
+            reject(new Error("AI 请求失败: " + (err.statusText || "网络错误")));
+          },
+        });
+      });
+    },
+
+    // 给消息添加「建议回复」按钮
+    addReplyButton(msgNode) {
+      if (msgNode.querySelector(".merida-reply-link")) return;
+
+      const contentEl = Vision._findContentEl(msgNode);
+      if (!contentEl) return;
+
+      const text = contentEl.textContent?.trim();
+      if (!text || text.length < 2) return;
+
+      const btn = Utils.el("span", { className: "merida-reply-link" }, [
+        "💬 建议回复",
+      ]);
+
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // 切换面板显示
+        const existing = msgNode.querySelector(".merida-reply-panel");
+        if (existing) {
+          existing.remove();
+          return;
+        }
+        // 关闭其他已打开的面板
+        document.querySelectorAll(".merida-reply-panel").forEach((p) => p.remove());
+        const panel = this._createPanel(msgNode);
+        contentEl.parentNode.insertBefore(panel, contentEl.nextSibling?.nextSibling || null);
+      });
+
+      // 插到翻译链接或翻译结果后面
+      const after =
+        msgNode.querySelector(".merida-translate-link") ||
+        msgNode.querySelector(".merida-translation") ||
+        contentEl;
+      if (after && after.nextSibling) {
+        after.parentNode.insertBefore(btn, after.nextSibling);
+      } else if (after) {
+        after.parentNode.appendChild(btn);
       }
+    },
+
+    // 创建回复建议面板
+    _createPanel(msgNode) {
+      const panel = Utils.el("div", { className: "merida-reply-panel" });
+
+      // 获取原始消息文本（给 AI 用）
+      const contentEl = Vision._findContentEl(msgNode);
+      const originalText = contentEl?.textContent?.trim() || "";
+
+      // 标签栏
+      const tabs = Utils.el("div", { className: "merida-reply-tabs" });
+
+      // AI 标签（如果配了 API Key 则显示在第一个）
+      const allTabs = [];
+      if (CONFIG.geminiApiKey) {
+        allTabs.push({ id: "ai", name: "✨ AI 智能回复", isAI: true });
+      }
+      this.templates.forEach((cat) => allTabs.push(cat));
+
+      allTabs.forEach((cat, i) => {
+        const tab = Utils.el(
+          "div",
+          {
+            className: `merida-reply-tab ${i === 0 ? "active" : ""} ${cat.isAI ? "merida-ai-tab" : ""}`,
+            onClick: () => {
+              tabs.querySelectorAll(".merida-reply-tab").forEach((t, j) =>
+                t.classList.toggle("active", j === i)
+              );
+              if (cat.isAI) {
+                this._renderAIReplies(panel, originalText);
+              } else {
+                const templateIndex = CONFIG.geminiApiKey ? i - 1 : i;
+                this._renderReplyItems(panel, templateIndex);
+              }
+            },
+          },
+          [cat.name]
+        );
+        tabs.appendChild(tab);
+      });
+      panel.appendChild(tabs);
+
+      // 内容区
+      const items = Utils.el("div", { className: "merida-reply-items" });
+      panel.appendChild(items);
+
+      // 默认显示第一个标签的内容
+      if (CONFIG.geminiApiKey) {
+        this._renderAIReplies(panel, originalText);
+      } else {
+        this._renderReplyItems(panel, 0);
+      }
+
+      // 点击面板外关闭
+      setTimeout(() => {
+        const closeHandler = (e) => {
+          if (!panel.contains(e.target) && !e.target.classList.contains("merida-reply-link")) {
+            panel.remove();
+            document.removeEventListener("click", closeHandler);
+          }
+        };
+        document.addEventListener("click", closeHandler);
+      }, 100);
+
+      return panel;
+    },
+
+    // 创建单条回复项（带复制按钮）
+    _createReplyRow(item, panel) {
+      const row = Utils.el("div", { className: "merida-reply-item" }, [
+        Utils.el("div", { className: "merida-reply-item-row" }, [
+          Utils.el("div", { className: "merida-reply-item-text" }, [
+            Utils.el("div", { className: "merida-reply-item-en" }, [item.en]),
+            Utils.el("div", { className: "merida-reply-item-zh" }, [item.zh]),
+          ]),
+          (() => {
+            const copyBtn = Utils.el("button", { className: "merida-copy-btn" }, ["复制"]);
+            copyBtn.addEventListener("click", (e) => {
+              e.stopPropagation();
+              GM_setClipboard(item.en);
+              copyBtn.textContent = "已复制 ✓";
+              copyBtn.classList.add("copied");
+              setTimeout(() => {
+                copyBtn.textContent = "复制";
+                copyBtn.classList.remove("copied");
+              }, 2000);
+              showToast("已复制英文回复 — 点 Discord 回复按钮后 Cmd+V 粘贴");
+            });
+            return copyBtn;
+          })(),
+        ]),
+      ]);
+
+      // 点击整行也能复制
+      row.addEventListener("click", () => {
+        GM_setClipboard(item.en);
+        panel.remove();
+        showToast(`已复制: "${item.en.slice(0, 50)}…"`);
+      });
+
+      return row;
+    },
+
+    _renderReplyItems(panel, catIndex) {
+      const container = panel.querySelector(".merida-reply-items");
+      container.innerHTML = "";
+
+      const cat = this.templates[catIndex];
+      if (!cat) return;
+
+      cat.items.forEach((item) => {
+        container.appendChild(this._createReplyRow(item, panel));
+      });
+    },
+
+    // 渲染 AI 生成的回复
+    async _renderAIReplies(panel, originalText) {
+      const container = panel.querySelector(".merida-reply-items");
+      container.innerHTML = "";
+
+      if (!originalText) {
+        container.appendChild(
+          Utils.el("div", { className: "merida-ai-loading" }, ["无法获取消息内容"])
+        );
+        return;
+      }
+
+      // 加载状态
+      container.appendChild(
+        Utils.el("div", { className: "merida-ai-loading" }, ["✨ AI 正在根据消息内容生成回复建议..."])
+      );
+
+      try {
+        const replies = await this.generateAIReplies(originalText);
+        container.innerHTML = "";
+
+        if (!replies || replies.length === 0) {
+          container.appendChild(
+            Utils.el("div", { className: "merida-ai-loading" }, ["AI 未生成有效回复，请重试"])
+          );
+          return;
+        }
+
+        replies.forEach((item) => {
+          if (item.en && item.zh) {
+            container.appendChild(this._createReplyRow(item, panel));
+          }
+        });
+      } catch (err) {
+        container.innerHTML = "";
+        container.appendChild(
+          Utils.el("div", { className: "merida-ai-loading" }, [
+            `AI 生成失败: ${err.message}`,
+          ])
+        );
+        console.error("[Merida] AI 回复生成失败:", err);
+      }
+    },
+
+    // 给所有消息加回复按钮
+    addToAll() {
+      const msgs = document.querySelectorAll('[class*="messageListItem_"]');
+      msgs.forEach((m) => this.addReplyButton(m));
     },
   };
 
@@ -996,6 +1500,17 @@
         点击模式：鼠标悬浮消息后点翻译按钮才翻译（省流量，按需翻译）
       </label>
 
+      <h3>💬 AI 智能回复 (Gemini)</h3>
+      <label>Gemini API Key（留空则只用预设话术）</label>
+      <input type="text" id="merida-cfg-gemini-key"
+             value="${CONFIG.geminiApiKey}"
+             placeholder="AIzaSy..." />
+      <label style="color:#72d4a3; font-size:12px;">
+        获取方式：访问 <a href="https://aistudio.google.com/apikey" target="_blank"
+        style="color:#7289da;">aistudio.google.com/apikey</a> → 创建 API Key → 粘贴到这里<br/>
+        填入后，「建议回复」面板会多出 ✨AI智能回复 标签，根据对方消息内容自动生成回复
+      </label>
+
       <h3>模块2「说」自定义黑话</h3>
       <label>每行一条，格式：中文 = 英文</label>
       <textarea id="merida-cfg-slang" rows="6" placeholder="来PK = Anyone down for a PK?&#10;组队 = LFG!">${
@@ -1044,6 +1559,10 @@
       // 翻译模式
       const modeRadio = panel.querySelector('input[name="merida-translate-mode"]:checked');
       if (modeRadio) await CONFIG.save("translateMode", modeRadio.value);
+
+      // Gemini API Key
+      const geminiKey = panel.querySelector("#merida-cfg-gemini-key").value.trim();
+      await CONFIG.save("geminiApiKey", geminiKey);
 
       // 自定义黑话
       const slangText = panel.querySelector("#merida-cfg-slang").value.trim();
@@ -1115,9 +1634,9 @@
             items.forEach((m) => Guard.scanMessage(m));
           }
 
-          // ---- 模块1：翻译（根据模式分流） ----
+          // ---- 模块1：翻译 ----
+          // 自动模式：新消息出现时自动翻译
           if (CONFIG.translateMode === "auto") {
-            // 自动模式：新消息出现时自动翻译
             if (
               node.matches?.('[class*="messageListItem_"]') ||
               node.querySelector?.('[class*="messageListItem_"]')
@@ -1128,18 +1647,22 @@
                   : [...node.querySelectorAll('[class*="messageListItem_"]')];
               msgItems.forEach((m) => Vision.autoTranslate(m));
             }
-          } else {
-            // 手动模式：在悬浮工具栏注入翻译按钮
-            if (
-              node.matches?.('[class*="buttonsInner_"]') ||
-              node.querySelector?.('[class*="buttonsInner_"]')
-            ) {
-              const toolbars =
-                node.matches('[class*="buttonsInner_"]')
-                  ? [node]
-                  : [...node.querySelectorAll('[class*="buttonsInner_"]')];
-              toolbars.forEach((tb) => Vision.injectButton(tb));
-            }
+          }
+          // 新消息：延迟 2 秒后检查，给漏翻的加「点击翻译」链接
+          if (
+            node.matches?.('[class*="messageListItem_"]') ||
+            node.querySelector?.('[class*="messageListItem_"]')
+          ) {
+            const linkItems =
+              node.matches('[class*="messageListItem_"]')
+                ? [node]
+                : [...node.querySelectorAll('[class*="messageListItem_"]')];
+            setTimeout(() => {
+              linkItems.forEach((m) => {
+                Vision.addTranslateLink(m);
+                SmartReply.addReplyButton(m);
+              });
+            }, 2000);
           }
 
           // ---- 模块2：在输入框工具栏注入黑话按钮 ----
@@ -1195,6 +1718,12 @@
 
     // 自动翻译已加载的消息
     Vision.scanAll();
+
+    // 延迟 3 秒后，给漏翻的消息加「点击翻译」链接
+    setTimeout(() => {
+      Vision.addLinksToAll();
+      SmartReply.addToAll();
+    }, 3000);
 
     // 注入输入框的黑话按钮
     const inputButtons = document.querySelectorAll('[class*="channelTextArea_"] [class*="buttons_"]');
