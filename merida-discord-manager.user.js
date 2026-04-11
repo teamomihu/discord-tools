@@ -997,7 +997,7 @@
           return;
         }
 
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${CONFIG.geminiApiKey}`;
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${CONFIG.geminiApiKey}`;
 
         const prompt = `你是一个 Discord 游戏社区的管理员助手。用户发了以下消息：
 
@@ -1021,7 +1021,11 @@
           headers: { "Content-Type": "application/json" },
           data: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.8, maxOutputTokens: 1024 },
+            generationConfig: {
+              temperature: 0.8,
+              maxOutputTokens: 8192,
+              thinkingConfig: { thinkingBudget: 0 },
+            },
           }),
           onload(resp) {
             try {
@@ -1030,11 +1034,16 @@
                 reject(new Error(data.error.message || "API 错误"));
                 return;
               }
-              const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+              // 兼容思考模型（2.5-flash）：跳过 thought 部分，取最后一个文本 part
+              const parts = data.candidates?.[0]?.content?.parts || [];
+              const textPart = parts.filter((p) => !p.thought).pop();
+              const text = textPart?.text || parts[parts.length - 1]?.text || "";
+              console.log("[Merida] AI 原始返回:", text.slice(0, 200));
               // 提取 JSON 数组
               const jsonMatch = text.match(/\[[\s\S]*\]/);
               if (!jsonMatch) {
-                reject(new Error("AI 返回格式异常"));
+                console.error("[Merida] AI 返回内容:", JSON.stringify(data, null, 2).slice(0, 2000));
+                reject(new Error("AI 返回格式异常，请打开控制台(Cmd+Option+J)查看详情"));
                 return;
               }
               const replies = JSON.parse(jsonMatch[0]);
