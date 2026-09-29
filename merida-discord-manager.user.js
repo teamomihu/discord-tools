@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Merida Discord 全能管理脚本
 // @namespace    https://github.com/merida/discord-manager
-// @version      1.0.0
+// @version      1.2.1
 // @description  Discord 游戏频道管理三合一：一键翻译(看) + 游戏黑话(说) + 关键词预警(管)
 // @author       Merida
 // @match        https://discord.com/*
@@ -177,6 +177,30 @@
         else if (c) node.appendChild(c);
       });
       return node;
+    },
+
+    // 找到节点所属的消息 li；若节点是包裹多条消息的容器则返回全部
+    messageItemsFrom(node) {
+      if (!node) return [];
+      const el =
+        node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+      if (!(el instanceof HTMLElement)) return [];
+      if (this.isMeridaEl(el)) return [];
+      if (el.matches('[class*="messageListItem_"]')) return [el];
+      const inside = el.closest('[class*="messageListItem_"]');
+      if (inside) return [inside];
+      if (el.querySelector?.('[class*="messageListItem_"]')) {
+        return [...el.querySelectorAll('[class*="messageListItem_"]')];
+      }
+      return [];
+    },
+
+    isMeridaEl(el) {
+      if (!(el instanceof HTMLElement)) return false;
+      if ([...el.classList].some((c) => c.startsWith("merida-"))) return true;
+      return !!el.closest?.(
+        ".merida-translation, .merida-translate-link, .merida-reply-link, .merida-reply-panel, .merida-toast, .merida-header-btn, .merida-alert-badge"
+      );
     },
 
     // 翻译图标 SVG
@@ -676,11 +700,12 @@
   //  所有非中文消息自动在原文下方显示中文翻译
   // ============================================================
   const Vision = {
-    _processed: new WeakSet(),  // 已处理的消息节点
+    _lastText: new WeakMap(),   // msgNode -> 上次用于翻译的原文（文本变了或翻译节点丢了就重翻）
     _queue: [],                 // 翻译队列
     _running: false,            // 队列是否正在处理
     _concurrency: 4,            // 同时最多几个翻译请求（提高到4）
     _activeCount: 0,
+    _debounce: new WeakMap(),   // msgNode -> 编辑/重绘防抖 timer
 
     // 查找消息的真正内容元素（跳过回复引用区）
     _findContentEl(msgNode) {
@@ -691,6 +716,54 @@
       );
       // 返回最后一个匹配的（回复消息中，真正的内容在引用区后面）
       return filtered.length > 0 ? filtered[filtered.length - 1] : null;
+    },
+
+    // Discord 正在编辑这条消息时，内部会出现输入框，不要拿半成品去翻
+    _isEditing(msgNode) {
+      if (!msgNode) return false;
+      return !!(
+        msgNode.querySelector('[class*="channelTextArea_"]') ||
+        msgNode.querySelector('[class*="operations_"]') ||
+        msgNode.querySelector("textarea") ||
+        msgNode.querySelector('[class*="textAreaSlate"]') ||
+        msgNode.querySelector('[class*="editor_"] [role="textbox"]')
+      );
+    },
+
+    // 提取用于翻译的纯文本：去掉「已编辑」标记和脚本自己插入的节点
+    _extractText(contentEl) {
+      if (!contentEl) return "";
+      const clone = contentEl.cloneNode(true);
+      clone
+        .querySelectorAll(
+          [
+            ".merida-translation",
+            ".merida-translate-link",
+            ".merida-reply-link",
+            ".merida-reply-panel",
+            ".merida-alert-badge",
+            '[class*="edited_"]',
+            '[class*="timestamp_"]',
+          ].join(",")
+        )
+        .forEach((el) => el.remove());
+      return (clone.textContent || "").replace(/\s+/g, " ").trim();
+    },
+
+    // 消息内容可能被 Discord 重绘（编辑保存、虚拟列表回收），防抖后再决定是否重翻
+    scheduleRefresh(msgNode) {
+      if (!msgNode) return;
+      const prev = this._debounce.get(msgNode);
+      if (prev) clearTimeout(prev);
+      const t = setTimeout(() => {
+        this._debounce.delete(msgNode);
+        if (!msgNode.isConnected) return;
+        if (this._isEditing(msgNode)) return;
+        if (CONFIG.translateMode === "auto") this.autoTranslate(msgNode);
+        this.addTranslateLink(msgNode);
+        SmartReply.addReplyButton(msgNode);
+      }, 350);
+      this._debounce.set(msgNode, t);
     },
 
     // 检测文本是否主要为中文（超过 40% 中文字符则跳过翻译）
@@ -746,27 +819,36 @@
       return map[code] || code;
     },
 
-    // 自动翻译单条消息
+    // 自动翻译单条消息。同一条 li 被编辑或翻译节点被 Discord 清掉时会重翻。
     async autoTranslate(msgNode) {
-      if (this._processed.has(msgNode)) return;
-      this._processed.add(msgNode);
+      if (!msgNode?.isConnected) return;
+      if (this._isEditing(msgNode)) return;
 
-      // 查找消息文本（跳过回复引用区）
       const contentEl = this._findContentEl(msgNode);
       if (!contentEl) return;
 
-      const text = contentEl.textContent?.trim();
+      const text = this._extractText(contentEl);
       if (!text || text.length < 2) return;
 
-      // 跳过已经是中文的消息
-      if (this.isChinese(text)) return;
+      // 跳过已经是中文的消息；若之前有翻译（例如改成了中文）则清掉
+      if (this.isChinese(text)) {
+        msgNode.querySelector(".merida-translation")?.remove();
+        this._lastText.set(msgNode, text);
+        return;
+      }
 
       // 跳过纯表情/纯链接
       if (/^(https?:\/\/\S+\s*)+$/.test(text)) return;
       if (/^[\p{Emoji}\s]+$/u.test(text)) return;
 
-      // 加入队列
-      this._queue.push({ msgNode, contentEl, text });
+      const existing = msgNode.querySelector(".merida-translation");
+      const last = this._lastText.get(msgNode);
+      if (existing && last === text) return;
+
+      if (existing && last !== text) existing.remove();
+
+      this._lastText.set(msgNode, text);
+      this._queue.push({ msgNode, text });
       this._processQueue();
     },
 
@@ -787,19 +869,31 @@
       }
     },
 
-    async _doTranslate({ msgNode, contentEl, text }) {
+    async _doTranslate({ msgNode, text }) {
       try {
-        // 再次检查是否已有翻译（防止重复）
+        if (!msgNode.isConnected) return;
+        if (this._isEditing(msgNode)) return;
+
+        const contentEl = this._findContentEl(msgNode);
+        if (!contentEl) return;
+
+        const liveText = this._extractText(contentEl);
+        if (liveText && liveText !== text) return;
+
         if (msgNode.querySelector(".merida-translation")) return;
 
         const result = await this.translate(text);
+
+        if (!msgNode.isConnected) return;
+        if (this._isEditing(msgNode)) return;
 
         // 如果 Google 检测到源语言就是中文，跳过
         if (result.lang === "zh-CN" || result.lang === "zh-TW" || result.lang === "zh") return;
         // 如果翻译结果和原文一样，跳过
         if (result.text.trim() === text.trim()) return;
 
-        // 再次检查（异步完成后可能已被处理）
+        const liveEl = this._findContentEl(msgNode);
+        if (!liveEl?.parentNode) return;
         if (msgNode.querySelector(".merida-translation")) return;
 
         const langLabel = this.langName(result.lang);
@@ -813,10 +907,12 @@
             result.text,
           ]
         );
-        contentEl.parentNode.insertBefore(transDiv, contentEl.nextSibling);
+        msgNode.querySelector(".merida-translate-link")?.remove();
+        liveEl.parentNode.insertBefore(transDiv, liveEl.nextSibling);
       } catch (err) {
         console.warn("[Merida] 翻译失败:", text.slice(0, 30), err.message);
-        // 静默失败，不弹 Toast 打扰用户
+        // 失败时清掉记录，后续 mutation 可以重试
+        if (this._lastText.get(msgNode) === text) this._lastText.delete(msgNode);
       }
     },
 
@@ -834,7 +930,7 @@
       const contentEl = this._findContentEl(msgContainer);
       if (!contentEl) return;
 
-      const text = contentEl.textContent?.trim();
+      const text = this._extractText(contentEl);
       if (!text) return;
 
       // 已有翻译则切换显示/隐藏
@@ -880,7 +976,7 @@
       const contentEl = this._findContentEl(msgNode);
       if (!contentEl) return;
 
-      const text = contentEl.textContent?.trim();
+      const text = this._extractText(contentEl);
       if (!text || text.length < 2) return;
       if (this.isChinese(text)) return;
       if (/^(https?:\/\/\S+\s*)+$/.test(text)) return;
@@ -1627,95 +1723,93 @@
   // ============================================================
   function startObserver() {
     const observer = new MutationObserver((mutations) => {
+      const newItems = new Set();
+      const updatedItems = new Set();
+
       for (const mutation of mutations) {
+        if (mutation.type === "characterData") {
+          Utils.messageItemsFrom(mutation.target).forEach((m) =>
+            updatedItems.add(m)
+          );
+          continue;
+        }
+
         for (const node of mutation.addedNodes) {
-          if (!(node instanceof HTMLElement)) continue;
-
-          // ---- 模块3：扫描新消息中的关键词 ----
-          if (
-            node.matches?.('[class*="messageListItem_"]') ||
-            node.querySelector?.('[class*="messageListItem_"]')
-          ) {
-            const items =
-              node.matches('[class*="messageListItem_"]')
-                ? [node]
-                : [...node.querySelectorAll('[class*="messageListItem_"]')];
-            items.forEach((m) => Guard.scanMessage(m));
-          }
-
-          // ---- 模块1：翻译 ----
-          // 自动模式：新消息出现时自动翻译
-          if (CONFIG.translateMode === "auto") {
+          if (node instanceof HTMLElement) {
+            // ---- 模块2：在输入框工具栏注入黑话按钮 ----
             if (
-              node.matches?.('[class*="messageListItem_"]') ||
-              node.querySelector?.('[class*="messageListItem_"]')
+              node.matches?.('[class*="buttons_"][class*="74017"]') ||
+              node.querySelector?.('[class*="buttons_"]')
             ) {
-              const msgItems =
-                node.matches('[class*="messageListItem_"]')
-                  ? [node]
-                  : [...node.querySelectorAll('[class*="messageListItem_"]')];
-              msgItems.forEach((m) => Vision.autoTranslate(m));
+              const btnContainers = node.matches?.('[class*="buttons_"]')
+                ? [node]
+                : [...node.querySelectorAll('[class*="buttons_"]')];
+              btnContainers.forEach((bc) => {
+                const isInputArea = bc.closest('[class*="channelTextArea_"]');
+                if (isInputArea) Voice.injectToggle(bc);
+              });
+            }
+
+            // ---- 频道头部：注入设置按钮 ----
+            if (
+              node.matches?.('[class*="toolbar_"]') ||
+              node.querySelector?.('[class*="toolbar_"]')
+            ) {
+              const toolbars = node.matches?.('[class*="toolbar_"]')
+                ? [node]
+                : [...node.querySelectorAll('[class*="toolbar_"]')];
+              toolbars.forEach((tb) => {
+                if (tb.querySelector(".merida-header-btn")) return;
+                const settingsBtn = Utils.el(
+                  "button",
+                  {
+                    className: "merida-header-btn",
+                    title: "Merida 脚本设置",
+                    onClick: openSettings,
+                  },
+                  ["⚙"]
+                );
+                tb.appendChild(settingsBtn);
+              });
+            }
+
+            // 新消息：added node 本身是 li，或是包裹多条 li 的容器
+            if (node.matches('[class*="messageListItem_"]')) {
+              newItems.add(node);
+              continue;
+            }
+            if (
+              !node.closest('[class*="messageListItem_"]') &&
+              node.querySelector('[class*="messageListItem_"]')
+            ) {
+              node
+                .querySelectorAll('[class*="messageListItem_"]')
+                .forEach((m) => newItems.add(m));
+              continue;
             }
           }
-          // 新消息：延迟 2 秒后检查，给漏翻的加「点击翻译」链接
-          if (
-            node.matches?.('[class*="messageListItem_"]') ||
-            node.querySelector?.('[class*="messageListItem_"]')
-          ) {
-            const linkItems =
-              node.matches('[class*="messageListItem_"]')
-                ? [node]
-                : [...node.querySelectorAll('[class*="messageListItem_"]')];
-            setTimeout(() => {
-              linkItems.forEach((m) => {
-                Vision.addTranslateLink(m);
-                SmartReply.addReplyButton(m);
-              });
-            }, 2000);
-          }
 
-          // ---- 模块2：在输入框工具栏注入黑话按钮 ----
-          if (
-            node.matches?.('[class*="buttons_"][class*="74017"]') ||
-            node.querySelector?.('[class*="buttons_"]')
-          ) {
-            const btnContainers = node.matches?.('[class*="buttons_"]')
-              ? [node]
-              : [...node.querySelectorAll('[class*="buttons_"]')];
-            btnContainers.forEach((bc) => {
-              // 确保是输入框旁边的按钮容器（不是消息里的）
-              const isInputArea = bc.closest('[class*="channelTextArea_"]');
-              if (isInputArea) Voice.injectToggle(bc);
-            });
-          }
-
-          // ---- 频道头部：注入设置按钮 ----
-          if (
-            node.matches?.('[class*="toolbar_"]') ||
-            node.querySelector?.('[class*="toolbar_"]')
-          ) {
-            const toolbars = node.matches?.('[class*="toolbar_"]')
-              ? [node]
-              : [...node.querySelectorAll('[class*="toolbar_"]')];
-            toolbars.forEach((tb) => {
-              if (tb.querySelector(".merida-header-btn")) return;
-              const settingsBtn = Utils.el(
-                "button",
-                {
-                  className: "merida-header-btn",
-                  title: "Merida 脚本设置",
-                  onClick: openSettings,
-                },
-                ["⚙"]
-              );
-              tb.appendChild(settingsBtn);
-            });
-          }
+          // 已有消息内部 DOM 变化（编辑保存、「已编辑」标记、内容重绘）
+          Utils.messageItemsFrom(node).forEach((m) => updatedItems.add(m));
         }
       }
+
+      newItems.forEach((m) => {
+        Guard.scanMessage(m);
+        if (CONFIG.translateMode === "auto") Vision.autoTranslate(m);
+        Vision.scheduleRefresh(m);
+      });
+      updatedItems.forEach((m) => {
+        if (newItems.has(m)) return;
+        Vision.scheduleRefresh(m);
+      });
     });
 
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
   }
 
   // ============================================================
